@@ -56,7 +56,7 @@ live_search() {
     _picked=$(: | menu "Search anime: " "" "$menu_extra_flags")
     _fzf_status=$?
     unset menu_reload
-    [ "$_fzf_status" -eq 130 ] && exit 1
+    [ "$_fzf_status" -ne 0 ] && return "$_fzf_status"
     query=$(printf "%s\n" "$_picked" | head -n 1)
     result=$(printf "%s\n" "$_picked" | sed -n '2p' | cut -f 2,3)
 }
