@@ -12,9 +12,11 @@ import datetime
 import concurrent.futures
 import subprocess
 import shutil
+import time
 
 FAV_DIR = os.path.expanduser(os.environ.get("ANI_CLI_HIST_DIR", "~/.local/state/ani-cli"))
 FAV_FILE = os.path.join(FAV_DIR, "favorites.txt")
+CACHE_FILE = os.path.join(FAV_DIR, "favorites_cache.json")
 
 def tty_print(msg):
     try:
@@ -45,6 +47,23 @@ def ensure_fav_file():
     if not os.path.exists(FAV_FILE):
         with open(FAV_FILE, "w") as f:
             pass
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache):
+    ensure_fav_file()
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
 
 def load_favorites():
     ensure_fav_file()
@@ -92,7 +111,7 @@ def get_anime_info(title):
         headers={"Content-Type": "application/json", "User-Agent": "ani-favorites/1.0"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return title, data.get("data", {}).get("Media")
     except Exception:
@@ -111,61 +130,130 @@ def format_countdown(seconds):
     else:
         return f"{mins}m"
 
-def fetch_all_favorites_info(fav_list):
+def entry_from_cache(raw_title, cdata, now_ts):
+    eng = cdata.get("display_title", raw_title)
+    status = cdata.get("status")
+    next_ep = cdata.get("next_ep")
+    airing_at = cdata.get("airing_at")
+
+    if next_ep and airing_at:
+        diff = int(airing_at - now_ts)
+        cd = format_countdown(diff)
+        badge = f"\033[1;33mEp {next_ep} in {cd}\033[0m"
+        clean_badge = f"Ep {next_ep} in {cd}"
+        time_until = max(diff, 0)
+    elif status == "FINISHED":
+        total = cdata.get("episodes") or "?"
+        badge = f"\033[1;32mCompleted ({total} eps)\033[0m"
+        clean_badge = f"Completed ({total} eps)"
+        time_until = 999999999
+    elif status == "NOT_YET_RELEASED":
+        badge = "\033[1;36mUpcoming\033[0m"
+        clean_badge = "Upcoming"
+        time_until = 888888888
+    else:
+        badge = f"\033[1;34m{status or 'Unknown'}\033[0m"
+        clean_badge = status or "Unknown"
+        time_until = 777777777
+
+    return {
+        "query_title": raw_title,
+        "display_title": eng,
+        "badge": badge,
+        "clean_badge": clean_badge,
+        "status": status,
+        "next_ep": next_ep,
+        "time_until": time_until,
+    }
+
+def fetch_all_favorites_info(fav_list, force_network=False):
     if not fav_list:
         return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(fav_list), 8)) as executor:
-        results = list(executor.map(get_anime_info, fav_list))
 
+    cache = load_cache()
+    now_ts = time.time()
     formatted = []
-    for raw_title, media in results:
-        if not media:
-            formatted.append({
-                "query_title": raw_title,
-                "display_title": raw_title,
-                "badge": "\033[1;30m[Not found]\033[0m",
-                "clean_badge": "Not found",
-                "status": "UNKNOWN",
-                "next_ep": None,
-                "time_until": float("inf"),
-            })
-            continue
+    missing_or_stale = []
 
-        eng = media["title"]["english"] or media["title"]["romaji"]
-        status = media.get("status")
-        next_ep = media.get("nextAiringEpisode")
-
-        if next_ep:
-            cd = format_countdown(next_ep["timeUntilAiring"])
-            badge = f"\033[1;33mEp {next_ep['episode']} in {cd}\033[0m"
-            clean_badge = f"Ep {next_ep['episode']} in {cd}"
-            time_until = next_ep["timeUntilAiring"]
-        elif status == "FINISHED":
-            total = media.get("episodes") or "?"
-            badge = f"\033[1;32mCompleted ({total} eps)\033[0m"
-            clean_badge = f"Completed ({total} eps)"
-            time_until = 999999999
-        elif status == "NOT_YET_RELEASED":
-            badge = "\033[1;36mUpcoming\033[0m"
-            clean_badge = "Upcoming"
-            time_until = 888888888
+    for raw in fav_list:
+        cdata = cache.get(raw.lower())
+        if not cdata or force_network:
+            missing_or_stale.append(raw)
         else:
-            badge = f"\033[1;34m{status}\033[0m"
-            clean_badge = status
-            time_until = 777777777
+            # Check if cache expired: if next episode time has passed or older than 12h
+            airing_at = cdata.get("airing_at")
+            updated_at = cdata.get("updated_at", 0)
+            if (airing_at and airing_at <= now_ts) or (now_ts - updated_at > 43200):
+                missing_or_stale.append(raw)
+            formatted.append(entry_from_cache(raw, cdata, now_ts))
 
-        formatted.append({
-            "query_title": raw_title,
-            "display_title": eng,
-            "badge": badge,
-            "clean_badge": clean_badge,
-            "status": status,
-            "next_ep": next_ep,
-            "time_until": time_until,
-        })
+    # If some items were missing, fetch only the missing ones
+    if missing_or_stale:
+        if not formatted:
+            # First time load: must fetch synchronously
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(missing_or_stale), 8)) as executor:
+                results = list(executor.map(get_anime_info, missing_or_stale))
+
+            for raw_title, media in results:
+                if not media:
+                    cache[raw_title.lower()] = {
+                        "display_title": raw_title,
+                        "status": "UNKNOWN",
+                        "episodes": None,
+                        "next_ep": None,
+                        "airing_at": None,
+                        "updated_at": now_ts,
+                    }
+                else:
+                    eng = media["title"]["english"] or media["title"]["romaji"]
+                    status = media.get("status")
+                    next_ep_obj = media.get("nextAiringEpisode")
+                    cache[raw_title.lower()] = {
+                        "display_title": eng,
+                        "status": status,
+                        "episodes": media.get("episodes"),
+                        "next_ep": next_ep_obj.get("episode") if next_ep_obj else None,
+                        "airing_at": next_ep_obj.get("airingAt") if next_ep_obj else None,
+                        "updated_at": now_ts,
+                    }
+                formatted.append(entry_from_cache(raw_title, cache[raw_title.lower()], now_ts))
+            save_cache(cache)
+        else:
+            # Trigger background refresh without blocking the user
+            try:
+                subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "--refresh-cache"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
 
     formatted.sort(key=lambda x: x["time_until"])
     return formatted
+
+def refresh_cache_background():
+    favs = load_favorites()
+    if not favs:
+        return
+    now_ts = time.time()
+    cache = load_cache()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(favs), 8)) as executor:
+        results = list(executor.map(get_anime_info, favs))
+
+    for raw_title, media in results:
+        if media:
+            eng = media["title"]["english"] or media["title"]["romaji"]
+            next_ep_obj = media.get("nextAiringEpisode")
+            cache[raw_title.lower()] = {
+                "display_title": eng,
+                "status": media.get("status"),
+                "episodes": media.get("episodes"),
+                "next_ep": next_ep_obj.get("episode") if next_ep_obj else None,
+                "airing_at": next_ep_obj.get("airingAt") if next_ep_obj else None,
+                "updated_at": now_ts,
+            }
+    save_cache(cache)
 
 def add_favorite(title):
     title = title.strip()
@@ -177,6 +265,31 @@ def add_favorite(title):
         return False
     favs.append(title)
     save_favorites(favs)
+
+    # Immediately populate cache for the new favorite
+    _, media = get_anime_info(title)
+    cache = load_cache()
+    if media:
+        eng = media["title"]["english"] or media["title"]["romaji"]
+        next_ep_obj = media.get("nextAiringEpisode")
+        cache[title.lower()] = {
+            "display_title": eng,
+            "status": media.get("status"),
+            "episodes": media.get("episodes"),
+            "next_ep": next_ep_obj.get("episode") if next_ep_obj else None,
+            "airing_at": next_ep_obj.get("airingAt") if next_ep_obj else None,
+            "updated_at": time.time(),
+        }
+    else:
+        cache[title.lower()] = {
+            "display_title": title,
+            "status": "UNKNOWN",
+            "episodes": None,
+            "next_ep": None,
+            "airing_at": None,
+            "updated_at": time.time(),
+        }
+    save_cache(cache)
     tty_print(f"\033[1;32mAdded to favorites:\033[0m {title}")
     return True
 
@@ -188,6 +301,12 @@ def remove_favorite(title):
         tty_print(f"'{title}' was not found in favorites.")
         return False
     save_favorites(new_favs)
+
+    cache = load_cache()
+    if title.lower() in cache:
+        del cache[title.lower()]
+        save_cache(cache)
+
     tty_print(f"\033[1;31mRemoved from favorites:\033[0m {title}")
     return True
 
@@ -294,6 +413,7 @@ def print_help():
 
 Storage:
   ~/.local/state/ani-cli/favorites.txt
+  ~/.local/state/ani-cli/favorites_cache.json
 """)
 
 def main():
@@ -308,6 +428,8 @@ def main():
     cmd = args[0].lower()
     if cmd in ("-h", "--help", "help"):
         print_help()
+    elif cmd in ("--refresh-cache", "refresh-cache"):
+        refresh_cache_background()
     elif cmd in ("-l", "--list", "list"):
         list_favorites()
     elif cmd in ("add", "-a", "--add"):
