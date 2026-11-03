@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""
+ani-favorites - Manage favorite anime and track next episode airings for ani-cli.
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import datetime
+import concurrent.futures
+import subprocess
+import shutil
+
+FAV_DIR = os.path.expanduser(os.environ.get("ANI_CLI_HIST_DIR", "~/.local/state/ani-cli"))
+FAV_FILE = os.path.join(FAV_DIR, "favorites.txt")
+
+def tty_print(msg):
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(msg + "\n")
+            tty.flush()
+    except Exception:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+def tty_input(prompt_text):
+    try:
+        with open("/dev/tty", "w") as tty_out:
+            tty_out.write(prompt_text)
+            tty_out.flush()
+        with open("/dev/tty", "r") as tty_in:
+            line = tty_in.readline()
+            return line.strip() if line else ""
+    except Exception:
+        sys.stderr.write(prompt_text)
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        return line.strip() if line else ""
+
+def ensure_fav_file():
+    if not os.path.exists(FAV_DIR):
+        os.makedirs(FAV_DIR, exist_ok=True)
+    if not os.path.exists(FAV_FILE):
+        with open(FAV_FILE, "w") as f:
+            pass
+
+def load_favorites():
+    ensure_fav_file()
+    try:
+        with open(FAV_FILE, "r") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    except Exception:
+        return []
+    seen = set()
+    favs = []
+    for x in lines:
+        if x.lower() not in seen:
+            seen.add(x.lower())
+            favs.append(x)
+    return favs
+
+def save_favorites(favs):
+    ensure_fav_file()
+    with open(FAV_FILE, "w") as f:
+        for fav in favs:
+            f.write(fav + "\n")
+
+def get_anime_info(title):
+    query = """
+    query ($search: String) {
+      Media(search: $search, type: ANIME) {
+        id
+        title {
+          english
+          romaji
+        }
+        status
+        episodes
+        nextAiringEpisode {
+          episode
+          timeUntilAiring
+          airingAt
+        }
+      }
+    }
+    """
+    req = urllib.request.Request(
+        "https://graphql.anilist.co",
+        data=json.dumps({"query": query, "variables": {"search": title}}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "ani-favorites/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return title, data.get("data", {}).get("Media")
+    except Exception:
+        return title, None
+
+def format_countdown(seconds):
+    if seconds <= 0:
+        return "Airing now"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    mins = (seconds % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    elif hours > 0:
+        return f"{hours}h {mins}m"
+    else:
+        return f"{mins}m"
+
+def fetch_all_favorites_info(fav_list):
+    if not fav_list:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(fav_list), 8)) as executor:
+        results = list(executor.map(get_anime_info, fav_list))
+
+    formatted = []
+    for raw_title, media in results:
+        if not media:
+            formatted.append({
+                "query_title": raw_title,
+                "display_title": raw_title,
+                "badge": "\033[1;30m[Not found]\033[0m",
+                "clean_badge": "Not found",
+                "status": "UNKNOWN",
+                "next_ep": None,
+                "time_until": float("inf"),
+            })
+            continue
+
+        eng = media["title"]["english"] or media["title"]["romaji"]
+        status = media.get("status")
+        next_ep = media.get("nextAiringEpisode")
+
+        if next_ep:
+            cd = format_countdown(next_ep["timeUntilAiring"])
+            badge = f"\033[1;33mEp {next_ep['episode']} in {cd}\033[0m"
+            clean_badge = f"Ep {next_ep['episode']} in {cd}"
+            time_until = next_ep["timeUntilAiring"]
+        elif status == "FINISHED":
+            total = media.get("episodes") or "?"
+            badge = f"\033[1;32mCompleted ({total} eps)\033[0m"
+            clean_badge = f"Completed ({total} eps)"
+            time_until = 999999999
+        elif status == "NOT_YET_RELEASED":
+            badge = "\033[1;36mUpcoming\033[0m"
+            clean_badge = "Upcoming"
+            time_until = 888888888
+        else:
+            badge = f"\033[1;34m{status}\033[0m"
+            clean_badge = status
+            time_until = 777777777
+
+        formatted.append({
+            "query_title": raw_title,
+            "display_title": eng,
+            "badge": badge,
+            "clean_badge": clean_badge,
+            "status": status,
+            "next_ep": next_ep,
+            "time_until": time_until,
+        })
+
+    formatted.sort(key=lambda x: x["time_until"])
+    return formatted
+
+def add_favorite(title):
+    title = title.strip()
+    if not title:
+        return False
+    favs = load_favorites()
+    if any(f.lower() == title.lower() for f in favs):
+        tty_print(f"'{title}' is already in favorites.")
+        return False
+    favs.append(title)
+    save_favorites(favs)
+    tty_print(f"\033[1;32mAdded to favorites:\033[0m {title}")
+    return True
+
+def remove_favorite(title):
+    title = title.strip()
+    favs = load_favorites()
+    new_favs = [f for f in favs if f.lower() != title.lower()]
+    if len(new_favs) == len(favs):
+        tty_print(f"'{title}' was not found in favorites.")
+        return False
+    save_favorites(new_favs)
+    tty_print(f"\033[1;31mRemoved from favorites:\033[0m {title}")
+    return True
+
+def list_favorites():
+    favs = load_favorites()
+    if not favs:
+        print("No favorites found. Add one with: ani-favorites add <title>")
+        return
+
+    print("\033[1;36m=== Favorite Anime Next Episode Tracking ===\033[0m")
+    infos = fetch_all_favorites_info(favs)
+    for item in infos:
+        print(f"  {item['badge']:<32} {item['display_title']}")
+    print()
+
+def interactive_menu(emit_title_only=False):
+    while True:
+        favs = load_favorites()
+        lines = []
+        mapping = {}
+
+        if favs:
+            infos = fetch_all_favorites_info(favs)
+            for item in infos:
+                menu_line = f"[{item['clean_badge']}]  {item['display_title']}"
+                lines.append(menu_line)
+                mapping[menu_line] = item["query_title"]
+            lines.append("─────────────────────────────────────")
+            lines.append("+ Add new favorite")
+            lines.append("- Remove a favorite")
+            prompt = "Select anime (or manage): "
+        else:
+            infos = []
+            lines.append("+ Add new favorite")
+            prompt = "No favorites yet - select to add one: "
+
+        menu_input = "\n".join(lines).encode("utf-8")
+        try:
+            proc = subprocess.Popen(
+                ["fzf", "--reverse", "--cycle", f"--prompt={prompt}"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, _ = proc.communicate(input=menu_input)
+        except Exception as e:
+            tty_print(f"Failed to launch fzf: {e}")
+            sys.exit(1)
+
+        if proc.returncode != 0:
+            sys.exit(0)
+
+        choice = stdout.decode("utf-8").strip()
+        if not choice or choice.startswith("─"):
+            continue
+
+        if choice == "+ Add new favorite":
+            new_title = tty_input("\033[1;36mEnter anime name to add: \033[0m")
+            if new_title:
+                add_favorite(new_title)
+            continue
+        elif choice == "- Remove a favorite":
+            if not favs:
+                continue
+            del_lines = [f"{item['display_title']}" for item in infos]
+            del_input = "\n".join(del_lines).encode("utf-8")
+            try:
+                del_proc = subprocess.Popen(
+                    ["fzf", "--reverse", "--cycle", "--prompt=Select favorite to remove: "],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                del_stdout, _ = del_proc.communicate(input=del_input)
+                if del_proc.returncode == 0:
+                    del_choice = del_stdout.decode("utf-8").strip()
+                    if del_choice:
+                        for item in infos:
+                            if item["display_title"] == del_choice:
+                                remove_favorite(item["query_title"])
+                                break
+            except Exception:
+                pass
+            continue
+        else:
+            selected_title = mapping.get(choice)
+            if not selected_title:
+                selected_title = choice.split("]  ")[-1].strip()
+
+            if emit_title_only:
+                print(selected_title)
+                sys.exit(0)
+            else:
+                tty_print(f"\033[1;34mLaunching ani-cli for:\033[0m {selected_title}")
+                os.execvp("ani-cli", ["ani-cli", selected_title])
+
+def print_help():
+    print("""Usage:
+  ani-favorites                      # Open interactive favorites menu
+  ani-favorites list                 # List favorites with next episode countdowns
+  ani-favorites add <anime title>    # Add an anime to favorites
+  ani-favorites remove [anime title] # Remove an anime from favorites
+  ani-favorites select               # Emit selected title to stdout (used by ani-cli)
+
+Storage:
+  ~/.local/state/ani-cli/favorites.txt
+""")
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        if sys.stdout.isatty() and shutil.which("fzf"):
+            interactive_menu(emit_title_only=False)
+        else:
+            list_favorites()
+        return
+
+    cmd = args[0].lower()
+    if cmd in ("-h", "--help", "help"):
+        print_help()
+    elif cmd in ("-l", "--list", "list"):
+        list_favorites()
+    elif cmd in ("add", "-a", "--add"):
+        if len(args) < 2:
+            title = tty_input("\033[1;36mEnter anime name to add: \033[0m")
+            if title:
+                add_favorite(title)
+        else:
+            add_favorite(" ".join(args[1:]))
+    elif cmd in ("remove", "rm", "del", "-d", "--remove"):
+        if len(args) < 2:
+            favs = load_favorites()
+            if not favs:
+                tty_print("No favorites to remove.")
+                sys.exit(0)
+            menu_input = "\n".join(favs).encode("utf-8")
+            proc = subprocess.Popen(
+                ["fzf", "--reverse", "--cycle", "--prompt=Select favorite to remove: "],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE
+            )
+            stdout, _ = proc.communicate(input=menu_input)
+            if proc.returncode == 0:
+                choice = stdout.decode("utf-8").strip()
+                if choice:
+                    remove_favorite(choice)
+        else:
+            remove_favorite(" ".join(args[1:]))
+    elif cmd in ("select", "--select"):
+        interactive_menu(emit_title_only=True)
+    else:
+        interactive_menu(emit_title_only=False)
+
+if __name__ == "__main__":
+    main()

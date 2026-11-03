@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+ani-schedule - Anime release schedule and daily timetable viewer for ani-cli.
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import datetime
+import shutil
+import subprocess
+
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+DAYS_SHORT = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+FAV_DIR = os.path.expanduser(os.environ.get("ANI_CLI_HIST_DIR", "~/.local/state/ani-cli"))
+FAV_FILE = os.path.join(FAV_DIR, "favorites.txt")
+
+def load_favorites_set():
+    if not os.path.exists(FAV_FILE):
+        return set()
+    try:
+        with open(FAV_FILE, "r") as f:
+            return {line.strip().lower() for line in f if line.strip() and not line.startswith("#")}
+    except Exception:
+        return set()
+
+def is_favorite(entry, fav_set):
+    if not fav_set:
+        return False
+    eng = (entry.get("english") or "").lower()
+    rom = (entry.get("romaji") or "").lower()
+    title = (entry.get("title") or "").lower()
+    for fav in fav_set:
+        if fav in (eng, rom, title):
+            return True
+        if len(fav) >= 4 and (fav in eng or fav in rom or (eng and eng in fav) or (rom and rom in fav)):
+            return True
+    return False
+
+def get_day_range(target_str, now=None):
+    if now is None:
+        now = datetime.datetime.now()
+    target = (target_str or "today").lower().strip()
+    today_start = datetime.datetime(now.year, now.month, now.day)
+
+    if target in ("today", ""):
+        start = today_start
+        end = start + datetime.timedelta(days=1)
+        label = f"Today ({start.strftime('%A, %b %d, %Y')})"
+        return [(start, end, label)]
+    elif target == "yesterday":
+        start = today_start - datetime.timedelta(days=1)
+        end = today_start
+        label = f"Yesterday ({start.strftime('%A, %b %d, %Y')})"
+        return [(start, end, label)]
+    elif target == "tomorrow":
+        start = today_start + datetime.timedelta(days=1)
+        end = start + datetime.timedelta(days=1)
+        label = f"Tomorrow ({start.strftime('%A, %b %d, %Y')})"
+        return [(start, end, label)]
+    elif target == "week":
+        current_idx = now.weekday()
+        week_start = today_start - datetime.timedelta(days=current_idx)
+        days_list = []
+        for i in range(7):
+            d_start = week_start + datetime.timedelta(days=i)
+            d_end = d_start + datetime.timedelta(days=1)
+            d_label = d_start.strftime("%A, %b %d")
+            if d_start.date() == now.date():
+                d_label += " [TODAY]"
+            days_list.append((d_start, d_end, d_label))
+        return days_list
+    elif target in DAYS or target in DAYS_SHORT:
+        target_idx = DAYS.index(target) if target in DAYS else DAYS_SHORT.index(target)
+        current_idx = now.weekday()
+        diff = target_idx - current_idx
+        start = today_start + datetime.timedelta(days=diff)
+        end = start + datetime.timedelta(days=1)
+        label = f"{start.strftime('%A, %b %d, %Y')}"
+        if start.date() == now.date():
+            label += " [TODAY]"
+        return [(start, end, label)]
+    else:
+        try:
+            start = datetime.datetime.strptime(target, "%Y-%m-%d")
+            end = start + datetime.timedelta(days=1)
+            label = f"{start.strftime('%A, %b %d, %Y')}"
+            return [(start, end, label)]
+        except ValueError:
+            return None
+
+def fetch_schedule(start_ts, end_ts):
+    query = """
+    query ($start: Int, $end: Int, $page: Int) {
+      Page(page: $page, perPage: 50) {
+        pageInfo {
+          hasNextPage
+        }
+        airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: TIME) {
+          episode
+          airingAt
+          media {
+            title {
+              english
+              romaji
+            }
+            countryOfOrigin
+            isAdult
+          }
+        }
+      }
+    }
+    """
+    page = 1
+    items = []
+    while True:
+        variables = {"start": start_ts, "end": end_ts, "page": page}
+        req = urllib.request.Request(
+            "https://graphql.anilist.co",
+            data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "ani-schedule/1.0"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            sys.stderr.write(f"Error fetching schedule: {e}\n")
+            return items
+
+        page_data = data.get("data", {}).get("Page", {})
+        airing = page_data.get("airingSchedules", [])
+        items.extend(airing)
+        if not page_data.get("pageInfo", {}).get("hasNextPage") or page >= 5:
+            break
+        page += 1
+
+    return items
+
+def format_entry(item, fav_set=None):
+    dt = datetime.datetime.fromtimestamp(item["airingAt"])
+    ep = item["episode"]
+    eng = item["media"]["title"]["english"]
+    rom = item["media"]["title"]["romaji"]
+    title = eng if eng else rom
+    time_str = dt.strftime("%I:%M %p")
+    entry_dict = {
+        "time_str": time_str,
+        "datetime": dt,
+        "episode": ep,
+        "title": title,
+        "romaji": rom,
+        "english": eng,
+    }
+    entry_dict["is_fav"] = is_favorite(entry_dict, fav_set) if fav_set else False
+    return entry_dict
+
+def print_help():
+    print("""Usage:
+  ani-schedule [options] [day]
+
+Days:
+  today (default), yesterday, tomorrow, week
+  monday, tuesday, wednesday, thursday, friday, saturday, sunday (or mon, tue...)
+  YYYY-MM-DD
+
+Options:
+  -l, --list       Print schedule list/table to stdout (non-interactive)
+  -p, --play       Interactive selection via fzf to launch ani-cli (default in TTY)
+  -h, --help       Show this help message
+
+Examples:
+  ani-schedule                   # Interactive selector for today's anime
+  ani-schedule yesterday         # Interactive selector for yesterday's releases
+  ani-schedule week --list       # View full schedule for the entire week
+  ani-schedule friday -l         # List Friday's releases
+""")
+
+def main():
+    args = sys.argv[1:]
+    mode = "auto"
+    target_day = "today"
+
+    cleaned_args = []
+    emit_select = False
+    for arg in args:
+        if arg in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif arg in ("-l", "--list"):
+            mode = "list"
+        elif arg in ("-p", "--play"):
+            mode = "play"
+        elif arg in ("-s", "--select"):
+            mode = "play"
+            emit_select = True
+        else:
+            cleaned_args.append(arg)
+
+    if cleaned_args:
+        target_day = " ".join(cleaned_args)
+
+    day_ranges = get_day_range(target_day)
+    if day_ranges is None:
+        sys.stderr.write(f"Error: Unknown day or date format: '{target_day}'\n")
+        sys.stderr.write("Valid options: today, yesterday, tomorrow, week, monday-sunday, YYYY-MM-DD\n")
+        sys.exit(1)
+
+    is_tty = sys.stdout.isatty()
+    has_fzf = shutil.which("fzf") is not None
+    is_week = len(day_ranges) > 1
+    fav_set = load_favorites_set()
+
+    if mode == "auto":
+        if is_tty and has_fzf:
+            mode = "play"
+        else:
+            mode = "list"
+
+    if mode == "list":
+        total_shows = 0
+        for start_dt, end_dt, label in day_ranges:
+            start_ts = int(start_dt.timestamp())
+            end_ts = int(end_dt.timestamp())
+            items = fetch_schedule(start_ts, end_ts)
+            total_shows += len(items)
+
+            print(f"\033[1;36m=== {label} ===\033[0m")
+            if not items:
+                print("  No scheduled releases found.\n")
+                continue
+
+            for raw in items:
+                entry = format_entry(raw, fav_set)
+                sub_label = f" ({entry['romaji']})" if entry['english'] and entry['romaji'] and entry['english'] != entry['romaji'] else ""
+                star = "⭐ " if entry["is_fav"] else "   "
+                title_color = "\033[1;37m" if entry["is_fav"] else ""
+                reset = "\033[0m" if entry["is_fav"] else ""
+                print(f"  \033[1;33m{entry['time_str']}\033[0m  \033[1;32mEp {entry['episode']:2d}\033[0m  {star}{title_color}{entry['title']}{reset}\033[2m{sub_label}\033[0m")
+            print()
+        sys.exit(0)
+
+    # Interactive play / select mode
+    lines = []
+    entry_map = {}
+    if is_week:
+        prompt_label = "Full Week"
+        for start_dt, end_dt, label in day_ranges:
+            start_ts = int(start_dt.timestamp())
+            end_ts = int(end_dt.timestamp())
+            items = fetch_schedule(start_ts, end_ts)
+            day_abbr = start_dt.strftime("%a")
+            for raw in items:
+                entry = format_entry(raw, fav_set)
+                star = "⭐ " if entry["is_fav"] else ""
+                alt = f" [{entry['romaji']}]" if entry['english'] and entry['romaji'] and entry['english'] != entry['romaji'] else ""
+                menu_line = f"[{day_abbr}] {entry['time_str']} | Ep {entry['episode']:2d} | {star}{entry['title']}{alt}"
+                lines.append(menu_line)
+                entry_map[menu_line] = entry["title"]
+    else:
+        start_dt, end_dt, label = day_ranges[0]
+        prompt_label = label
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        items = fetch_schedule(start_ts, end_ts)
+        for raw in items:
+            entry = format_entry(raw, fav_set)
+            star = "⭐ " if entry["is_fav"] else ""
+            alt = f" [{entry['romaji']}]" if entry['english'] and entry['romaji'] and entry['english'] != entry['romaji'] else ""
+            menu_line = f"{entry['time_str']} | Ep {entry['episode']:2d} | {star}{entry['title']}{alt}"
+            lines.append(menu_line)
+            entry_map[menu_line] = entry["title"]
+
+    if not lines:
+        print(f"No scheduled releases found for {prompt_label}.")
+        sys.exit(0)
+        entry_map[menu_line] = entry["title"]
+
+    menu_input = "\n".join(lines).encode("utf-8")
+    try:
+        proc = subprocess.Popen(
+            ["fzf", "--reverse", "--cycle", f"--prompt=Select show ({label}): "],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, _ = proc.communicate(input=menu_input)
+    except Exception as e:
+        sys.stderr.write(f"Failed to launch fzf: {e}\n")
+        sys.exit(1)
+
+    if proc.returncode != 0:
+        sys.exit(0)
+
+    selected = stdout.decode("utf-8").strip()
+    if not selected:
+        sys.exit(0)
+
+    title_to_play = entry_map.get(selected)
+    if not title_to_play:
+        # Fallback parse
+        parts = selected.split(" | ")
+        if len(parts) >= 3:
+            title_to_play = parts[2].split(" [")[0].strip()
+        else:
+            title_to_play = selected
+
+    if emit_select:
+        print(title_to_play)
+        sys.exit(0)
+
+    print(f"\033[1;34mLaunching ani-cli for:\033[0m {title_to_play}")
+    os.execvp("ani-cli", ["ani-cli", title_to_play])
+
+if __name__ == "__main__":
+    main()
