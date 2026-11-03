@@ -8,7 +8,7 @@ version_number="5.3.0"
 # $1 = prompt, $2 = multi select flag (for fzf/rofi), $3 = extra flags by user
 menu() {
     case "$menu_program" in
-        fzf) fzf --reverse --cycle --prompt "$1" --delimiter '\t' --with-nth 1,4,3 --tabstop 4 ${menu_preview:+--preview "$menu_preview" --preview-window "$preview_window"} ${menu_reload:+--disabled --print-query --bind "change:reload($menu_reload)"} $2 $3 ;;
+        fzf) fzf --reverse --cycle --prompt "$1" --delimiter '\t' --with-nth "${menu_with_nth:-1,4,3}" --tabstop 4 ${menu_preview:+--preview "$menu_preview" --preview-window "$preview_window"} ${menu_reload:+--disabled --print-query --bind "change:reload($menu_reload)"} $2 $3 ;;
         rofi) rofi -sort -dmenu -i -p "$1" $2 $3 ;;
         dmenu) dmenu -l 20 -p "$1" $3 ;;
         *) "$menu_program" $3 "$1" ;;
@@ -20,9 +20,9 @@ nth() {
     _stdin=$(cat -)
     [ -z "$_stdin" ] && return 1
     _line_count="$(printf "%s\n" "$_stdin" | wc -l | tr -d "[:space:]")"
-    [ "$_line_count" -eq 1 ] && printf "%s" "$_stdin" | cut -f 2,3 && return 0
+    [ "$_line_count" -eq 1 ] && [ "${3:-}" != "force" ] && printf "%s" "$_stdin" | cut -f 2- && return 0
     _prompt="$1"
-    [ $# -ne 1 ] && _multi_flag="$2"
+    [ $# -ge 2 ] && _multi_flag="$2"
     if [ "$menu_program" = "fzf" ]; then
         # fzf gets the raw lines, it hides the id and reorders the columns itself (see menu)
         _line=$(printf "%s" "$_stdin" | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -f 1)
@@ -34,7 +34,7 @@ nth() {
     _line_end=$(printf "%s" "$_line" | tail -n 1)
     [ -n "$_line" ] || return 1
     if [ "$_line_start" = "$_line_end" ]; then
-        printf "%s" "$_stdin" | grep -E '^'"${_line}"'($|[[:space:]])' | cut -f 2,3 || return 1
+        printf "%s" "$_stdin" | grep -E '^'"${_line}"'($|[[:space:]])' | cut -f 2- || return 1
     else
         printf "%s" "$_stdin" | sed -n '/^'"${_line_start}"'$/,/^'"${_line_end}$"'/p' || return 1
     fi
@@ -409,8 +409,8 @@ backup_old_hist() {
 
 process_hist_entry() {
     ep_list=$(hianime_episodes "$anime_id" | cut -f 2)
-    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
-    [ -n "$ep_no" ] && printf "%s\t%s - episode %s\n" "$anime_id" "$anime_title" "$ep_no"
+    next_ep=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
+    [ -n "$next_ep" ] && printf "%s\t%s (Next: Episode %s | Last watched: Episode %s)\t%s\t%s\n" "$anime_id" "$anime_title" "$next_ep" "$ep_no" "$next_ep" "$anime_title"
 }
 
 update_history() {
@@ -752,25 +752,41 @@ while :; do
     case "$source" in
         history)
             backup_old_hist
-            anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
+            anime_list=$(while IFS="$(printf '\t')" read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
             wait
-            [ -z "$anime_list" ] && die "No unwatched series in history!"
+            if [ -z "$anime_list" ]; then
+                if [ "$hub_mode" = 1 ]; then
+                    info "No unwatched series in history!"
+                    sleep 1.5
+                    source=search
+                    continue
+                else
+                    die "No unwatched series in history!"
+                fi
+            fi
             menu_preview="sh '$script_path' --info {2}"
-            [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
+            menu_with_nth="1,3"
+            if [ -z "${index##*[!0-9]*}" ]; then
+                selected_anime=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " "" "force")
+            else
+                selected_anime=$(printf "%s" "$anime_list" | sed -n "${index}p")
+            fi
             unset menu_preview
-            [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
+            unset menu_with_nth
+
+            anime_id=$(printf "%s" "$selected_anime" | cut -f 1)
             if [ -z "$anime_id" ]; then
                 if [ "$hub_mode" = 1 ]; then
                     source=search
                     continue
                 else
-                    exit 1
+                    exit 0
                 fi
             fi
-            anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed 's| - episode.*||')
+            ep_no=$(printf "%s" "$selected_anime" | cut -f 3)
+            anime_title=$(printf "%s" "$selected_anime" | cut -f 4)
             episode_maps="$(hianime_episodes "$anime_id")" || exit 1
             ep_list="$(printf "%s" "$episode_maps" | cut -f 2)"
-            ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
             break
             ;;
         *)
