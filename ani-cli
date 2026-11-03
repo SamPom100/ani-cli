@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="5.1.6"
+version_number="5.3.0"
 
 # UI
 
@@ -8,14 +8,14 @@ version_number="5.1.6"
 # $1 = prompt, $2 = multi select flag (for fzf/rofi), $3 = extra flags by user
 menu() {
     case "$menu_program" in
-        fzf) fzf --reverse --cycle --prompt "$1" $2 $3 ;;
+        fzf) fzf --reverse --cycle --prompt "$1" --delimiter '\t' --with-nth 1,4,3 --tabstop 4 ${menu_preview:+--preview "$menu_preview" --preview-window "$preview_window"} ${menu_reload:+--disabled --print-query --bind "change:reload($menu_reload)"} $2 $3 ;;
         rofi) rofi -sort -dmenu -i -p "$1" $2 $3 ;;
         dmenu) dmenu -l 20 -p "$1" $3 ;;
         *) "$menu_program" $3 "$1" ;;
     esac
 }
 
-# provide menu. input format is either (ep_list) or (number \t anime_id \t anime_name)
+# provide menu. input format is either (ep_list) or (number \t anime_id \t anime_name [\t details])
 nth() {
     _stdin=$(cat -)
     [ -z "$_stdin" ] && return 1
@@ -23,7 +23,13 @@ nth() {
     [ "$_line_count" -eq 1 ] && printf "%s" "$_stdin" | cut -f 2,3 && return 0
     _prompt="$1"
     [ $# -ne 1 ] && _multi_flag="$2"
-    _line=$(printf "%s" "$_stdin" | cut -f 1,3 | tr '\t' ' ' | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -d " " -f 1)
+    if [ "$menu_program" = "fzf" ]; then
+        # fzf gets the raw lines, it hides the id and reorders the columns itself (see menu)
+        _line=$(printf "%s" "$_stdin" | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -f 1)
+    else
+        # other menus get plain text: number, details (if any), then the name. literal tabs, BSD sed has no \t in brackets
+        _line=$(printf "%s" "$_stdin" | sed -E 's|^([^	]*)	[^	]*	([^	]*)	([^	]*)$|\1 \3 \2|' | cut -f 1,3 | tr '\t' ' ' | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -d " " -f 1)
+    fi
     _line_start=$(printf "%s" "$_line" | head -n 1)
     _line_end=$(printf "%s" "$_line" | tail -n 1)
     [ -n "$_line" ] || return 1
@@ -32,6 +38,27 @@ nth() {
     else
         printf "%s" "$_stdin" | sed -n '/^'"${_line_start}"'$/,/^'"${_line_end}$"'/p' || return 1
     fi
+}
+
+# fzf reloads a list while typing since 0.25
+fzf_reloads() {
+    _fzf_version=$(fzf --version | cut -d ' ' -f 1)
+    case "$_fzf_version" in
+        0.[0-9].* | 0.1[0-9].* | 0.2[0-4].*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# search while typing: fzf asks the site again after every change and shows what it found, Enter picks a result.
+# sets query (what was typed) and result (id \t title of the pick, empty when nothing was picked)
+live_search() {
+    menu_reload="sleep 0.3; sh '$script_path' --search {q}"
+    _picked=$(: | menu "Search anime: " "" "$menu_extra_flags")
+    _fzf_status=$?
+    unset menu_reload
+    [ "$_fzf_status" -eq 130 ] && exit 1
+    query=$(printf "%s\n" "$_picked" | head -n 1)
+    result=$(printf "%s\n" "$_picked" | sed -n '2p' | cut -f 2,3)
 }
 
 die() {
@@ -91,6 +118,10 @@ help_info() {
         Manage favorite anime and view next episode countdowns
       -t, --schedule, --timetable [day]
         Display daily schedule/releases (e.g. today, yesterday, week, friday)
+      --info
+        Show the details of an anime id, this is what the preview pane displays
+      --search
+        List what the site finds for a query, this is what the search prompt reloads while typing
       -U, --update
         Update the script
     Some example usages:
@@ -199,7 +230,17 @@ deobfuscate_blob() (
     printf "%b" "$_output"
 )
 
-# search the query and give results. format is (id \t name)
+# turns the html entities the site uses for titles and descriptions back into characters
+decode_entities() {
+    sed -e "s|&#039;|'|g" -e 's|&quot;|"|g' -e 's|&lt;|<|g' -e 's|&gt;|>|g' -e "s|&amp;|\&|g"
+}
+
+# appends the first group of the regex $1 as a new tab separated column, "-" when the line has no match
+tab_column() {
+    sed -E -e "s|^(.*$1.*)\$|\\1\\t\\2|" -e t -e 's|$|\t-|'
+}
+
+# search the query and give results. format is (id \t name \t details)
 hianime_search() {
     #shellcheck disable=SC2059
     _page="$(hianime_curl "$(printf "$search_api" "$1")")" || return 1
@@ -208,9 +249,50 @@ hianime_search() {
         die "Blocked by cloudflare."
     fi
     # the top 10 sidebar repeats the result markup, cut it off before flattening the page
-    printf "%s" "$_page" | sed '/id="main-sidebar"/,$d' | tr '\n' ' ' | sed 's|<div class="film-detail">|\n<div class="film-detail">|g' |
-        sed -nE 's|.*<h3 class="film-name">[[:space:]]*<a href="[^"]*/([^"/]*)"[[:space:]]*title="([^"]*)".*|\1\t\2|p' |
-        sed -e "s|&#039;|'|g" -e 's|&quot;|"|g' -e "s|&amp;|\&|g"
+    # one line per result: the poster ticks (episode counts) come first, then the film-detail with id, title and type
+    printf "%s" "$_page" | sed '/id="main-sidebar"/,$d' | tr '\n\t' '  ' | sed 's|<div class="flw-item|\n<div class="flw-item|g' |
+        tab_column '<span class="fdi-item">([A-Za-z]+)' | tab_column 'tick-eps">[[:space:]]*([0-9]+)' |
+        tab_column 'tick-sub">[[:space:]]*<i[^>]*></i>[[:space:]]*([0-9]+)' | tab_column 'tick-dub">[[:space:]]*<i[^>]*></i>[[:space:]]*([0-9]+)' |
+        sed -nE 's|.*<h3 class="film-name">[[:space:]]*<a href="[^"]*/([^"/]*)"[[:space:]]*title="([^"]*)".*\t([A-Za-z-]+\t[0-9-]+\t[0-9-]+\t[0-9-]+)$|\1\t\2\t\3|p' |
+        decode_entities |
+        while IFS="	" read -r _id _title _type _eps _sub _dub || [ -n "$_id" ]; do
+            case "$_type" in MOVIE) _type=Movie ;; SPECIAL) _type=Special ;; MUSIC) _type=Music ;; *) ;; esac
+            [ "$_eps" = "-" ] && _eps="?"
+            printf "%s\t%s\t%-7s %4s ep  sub %-4s dub %-4s  \n" "$_id" "$_title" "$_type" "$_eps" "$_sub" "$_dub"
+        done
+}
+
+# prints what follows the first occurrence of $1 on a single line
+after_first() {
+    sed "s|$1|\\n|" | sed -n '2p'
+}
+
+# print the details of the anime with id $1, this is what the preview pane shows
+hianime_info() {
+    case "$1" in
+        "" | *[!A-Za-z0-9._-]*) die "Invalid anime id: $1" ;;
+        *) ;;
+    esac
+    _page="$(hianime_curl "$base_api/$1" 2>/dev/null)" || {
+        printf "No details available\n"
+        exit 1
+    }
+    _page="$(printf "%s" "$_page" | tr '\n\t' '  ' | sed 's/  */ /g')"
+    _title="$(printf "%s" "$_page" | after_first '<h2 class="film-name' | sed -nE 's|^[^>]*> *([^<]*[^< ]) *<.*|\1|p' | decode_entities)"
+    _rating="$(printf "%s" "$_page" | after_first 'tick-pg">' | sed 's| *<.*||')"
+    # the anisc-info block lists the facts, one item each. an item ends at its first closing div, links become comma separated
+    _items="$(printf "%s" "$_page" | after_first '<div class="anisc-info">' | sed 's|<div class="item |\n<div class="item |g' | sed 's|</div>.*||; s|</a>|,|g' |
+        sed -nE 's|.*item-head">([^<:]*):</span>(.*)|\1\t\2|p' | sed 's|<[^>]*>| |g; s/  */ /g; s/ *, */, /g; s/ *,* *$//; s/\t /\t/' | decode_entities)"
+    [ -n "$_rating" ] && _items="$(printf "%s\nRating\t%s" "$_items" "$_rating")"
+    _seasons="$(printf "%s" "$_page" | sed 's|class="os-item|\n&|g' | sed '1d; s|</a>.*||' |
+        sed -nE 's|^class="os-item ?(active)?"[^>]*>.*<div class="title">([^<]*)</div>.*|\2 \1|p' | sed 's| active$| (this)|; s| $||' | tr '\n' ',' | sed 's|,$||; s|,|, |g' | decode_entities)"
+    [ -n "$_seasons" ] && _items="$(printf "%s\nSeasons\t%s" "$_items" "$_seasons")"
+    printf "\033[1m%s\033[0m\n\n" "$_title"
+    printf "%s\n" "$_items" | grep -v "^Overview" | while IFS="	" read -r _key _value; do
+        [ -n "$_key" ] && printf "\033[1;34m%-10s\033[0m %s\n" "$_key" "$_value"
+    done
+    printf "%s\n" "$_items" | sed -n 's|^Overview\t|\n|p'
+    exit 0
 }
 
 # get the episodes list of the selected anime. format is (id \t ep_no)
@@ -240,10 +322,8 @@ hianime_m3u8() {
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
     sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
-    _playlist="$(hianime_curl "$_m3u8_master" -e "$refr")"
     # quality variants are relative to the master playlist
-    links="$(printf "%s\n" "$_playlist" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
-    audio_link="$(printf "%s\n" "$_playlist" | sed -nE '/^#EXT-X-MEDIA:TYPE=AUDIO,.*DEFAULT=YES/{s|.*URI="([^"]*)".*|\1|p;q;}' | sed "\|^https*://|!s|^|${_m3u8_master%/*}/|")"
+    links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
 }
 
@@ -352,8 +432,8 @@ update_history() {
 download() {
     _name="$(printf "%s" "$2" | tr '<>:"/\\|?*' '_')"
     [ -n "$sub_link" ] && $curl_exe -sL -A "$agent" -e "$refr" --max-time 10 $cipher_flag "$sub_link" -o "$download_dir/$_name.vtt"
-    [ -z "$audio_link" ] && command -v "yt-dlp" >/dev/null && yt-dlp --referer "$refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$download_dir/$_name.mp4" $3 && return 0
-    ffmpeg -extension_picky 0 -referer "$refr" -loglevel error -stats -i "$1" ${audio_link:+-extension_picky 0 -referer "$refr" -i "$audio_link"} -c copy "$download_dir/$_name.mp4" $3
+    command -v "yt-dlp" >/dev/null && yt-dlp --referer "$refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$download_dir/$_name.mp4" $3 && return 0
+    ffmpeg -extension_picky 0 -referer "$refr" -loglevel error -stats -i "$1" -c copy "$download_dir/$_name.mp4" $3
 }
 
 # mpv-android takes no options from the intent, so they go through a file the user includes in mpv.conf
@@ -362,7 +442,7 @@ android_mpv() {
     _conf_dir="/storage/emulated/0/mpv"
     if [ -w "${_conf_dir%/mpv}" ]; then
         [ -d "$_conf_dir" ] || mkdir "$_conf_dir"
-        printf "referrer=%s\n%s\n%s\n" "$refr" "${sub_link:+sub-file=$sub_link}" "${audio_link:+audio-file=$audio_link}" >"$_conf_dir/mpv.config.mp4"
+        printf "referrer=%s\n%s\n" "$refr" "${sub_link:+sub-file=$sub_link}" >"$_conf_dir/mpv.config.mp4"
     fi
     nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
 }
@@ -375,15 +455,15 @@ play_episode() {
     wait
     # shellcheck disable=SC2086
     case "$player_function" in
-        debug) printf "All links:\n%s\nSelected link:\n%s\nAudio:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$audio_link" "$sub_link" ;;
+        debug) printf "All links:\n%s\nSelected link:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$sub_link" ;;
         android_mpv) android_mpv ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
         *mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                $player_function --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
@@ -391,16 +471,15 @@ play_episode() {
         *iina*)
             # mpv splits sub-files on ':', so the url has to be escaped for iina
             _sub_iina="$(printf "%s" "$sub_link" | sed 's|:|\\:|g')"
-            _audio_iina="$(printf "%s" "$audio_link" | sed 's|:|\\:|g')"
             if pgrep -f "IINA" >/dev/null 2>&1; then
                 # omit --keep-running when an IINA instance exists to prevent hanging
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --mpv-referrer="$refr" ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             fi
             ;;
-        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" :input-slave="${audio_link:+$audio_link#}$sub_link" >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
+        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" ${sub_link:+:input-slave="$sub_link"} >/dev/null 2>&1 & ;;
+        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
         download) "$player_function" "$video_link" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
         catt) nohup catt cast $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
         iSH)
@@ -458,7 +537,6 @@ mode="${ANI_CLI_MODE:-sub}"
 download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
 log_episode="${ANI_CLI_LOG:-1}"
 quality="${ANI_CLI_QUALITY:-best}"
-exact_match="${ANI_CLI_EXACT:-0}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
@@ -482,6 +560,11 @@ exit_after_play="${ANI_CLI_EXIT_AFTER_PLAY:-0}"
 skip_intro="${ANI_CLI_SKIP_INTRO:-0}"
 menu_program="${ANI_CLI_MENU:-fzf}"
 menu_extra_flags="${ANI_CLI_MENU_FLAGS:-""}"
+# the preview pane runs this script again with --info for the highlighted anime, it goes below the list on narrow terminals
+script_path="$(command -v "$0" || printf "%s" "$0")"
+preview_window="right:40%:wrap"
+_cols="$(tput cols 2>/dev/null)"
+[ "${_cols:-100}" -lt 100 ] 2>/dev/null && preview_window="down:40%:wrap"
 
 # not opening from a terminal
 if [ ! -t 0 ]; then
@@ -558,23 +641,25 @@ while [ $# -gt 0 ]; do
         --skip) skip_intro=1 ;;
         -N | --nextep-countdown) source=nextep ;;
         -f | --fav | --favorites)
-            if command -v ani-favorites >/dev/null 2>&1; then
-                exec ani-favorites
-            elif [ -x "${0%/*}/ani-favorites" ]; then
-                exec "${0%/*}/ani-favorites"
-            else
-                die "ani-favorites helper not found"
-            fi
+            fav_bin="ani-favorites"
+            command -v ani-favorites >/dev/null 2>&1 || [ -x "${0%/*}/ani-favorites" ] && fav_bin="${0%/*}/ani-favorites"
+            exec "$fav_bin"
             ;;
         -t | --schedule | --timetable)
             shift
-            if command -v ani-schedule >/dev/null 2>&1; then
-                exec ani-schedule "$@"
-            elif [ -x "${0%/*}/ani-schedule" ]; then
-                exec "${0%/*}/ani-schedule" "$@"
-            else
-                die "ani-schedule helper not found"
-            fi
+            sched_bin="ani-schedule"
+            command -v ani-schedule >/dev/null 2>&1 || [ -x "${0%/*}/ani-schedule" ] && sched_bin="${0%/*}/ani-schedule"
+            exec "$sched_bin" "$@"
+            ;;
+        --info)
+            [ $# -lt 2 ] && die "missing argument!"
+            hianime_info "$2"
+            ;;
+        --search)
+            [ $# -lt 2 ] && die "missing argument!"
+            query=$(printf "%s" "$2" | sed 's| |+|g')
+            [ "${#query}" -ge 2 ] && hianime_search "$query" | nl -w 2 | sed 's/^[[:space:]]//'
+            exit 0
             ;;
         -U | --update)
             dep_ch "patch"
@@ -613,12 +698,11 @@ command -v ani-favorites >/dev/null 2>&1 || [ -x "${0%/*}/ani-favorites" ] && fa
 sched_bin="ani-schedule"
 command -v ani-schedule >/dev/null 2>&1 || [ -x "${0%/*}/ani-schedule" ] && sched_bin="${0%/*}/ani-schedule"
 
-# interactive hub menu when invoked with no arguments
 hub_mode=0
 [ -z "$query" ] && [ "$source" = "search" ] && [ -t 0 ] && hub_mode=1
 
 while :; do
-    if [ "$hub_mode" = 1 ] && [ -z "$query" ] && [ "$source" = "search" ]; then
+    if [ "$hub_mode" = 1 ] && [ -z "$query" ] && [ -z "$result" ] && [ "$source" = "search" ]; then
         main_menu_choice=$(printf "Favorites\nSearch\nSchedule\nContinue\nQuit\n" | menu "Select option: " "" "$menu_extra_flags")
         [ -z "$main_menu_choice" ] || [ "$main_menu_choice" = "Quit" ] && exit 0
         case "$main_menu_choice" in
@@ -643,12 +727,20 @@ while :; do
                 source=history
                 ;;
             Search)
-                if [ "$menu_program" = "fzf" ]; then
-                    query=$(: | fzf --reverse --no-info --no-separator --print-query --prompt="Search anime: " $menu_extra_flags | head -n 1)
+                if [ "$menu_program" = "fzf" ] && fzf_reloads; then
+                    menu_preview="sh '$script_path' --info {2}"
+                    live_search
+                    _fzf_rc=$?
+                    unset menu_preview
+                    if [ "$_fzf_rc" -eq 130 ] || { [ -z "$query" ] && [ -z "$result" ]; }; then
+                        query=""
+                        result=""
+                        continue
+                    fi
                 else
-                    printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+                    query=$(: | fzf --reverse --no-info --no-separator --print-query --prompt="Search anime: " $menu_extra_flags | head -n 1)
+                    [ -z "$query" ] && continue
                 fi
-                [ -z "$query" ] && continue
                 ;;
             *)
                 exit 0
@@ -663,7 +755,9 @@ while :; do
             anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
             wait
             [ -z "$anime_list" ] && die "No unwatched series in history!"
+            menu_preview="sh '$script_path' --info {2}"
             [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
+            unset menu_preview
             [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
             if [ -z "$anime_id" ]; then
                 if [ "$hub_mode" = 1 ]; then
@@ -680,46 +774,56 @@ while :; do
             break
             ;;
         *)
-            if [ -z "$query" ]; then
-                if [ "$menu_program" = "fzf" ]; then
-                    query=$(: | fzf --reverse --no-info --no-separator --print-query --prompt="Search anime: " $menu_extra_flags | head -n 1)
+            if [ -z "$query" ] && [ -z "$result" ]; then
+                if [ "$menu_program" = "fzf" ] && fzf_reloads; then
+                    menu_preview="sh '$script_path' --info {2}"
+                    live_search
+                    _fzf_rc=$?
+                    unset menu_preview
+                    if [ "$_fzf_rc" -eq 130 ] || { [ -z "$query" ] && [ -z "$result" ]; }; then
+                        query=""
+                        result=""
+                        [ "$hub_mode" = 1 ] && continue || exit 0
+                    fi
                 else
                     printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+                    [ -z "$query" ] && { [ "$hub_mode" = 1 ] && continue || exit 0; }
                 fi
-                [ -z "$query" ] && { [ "$hub_mode" = 1 ] && continue || exit 1; }
             fi
+
             # for checking new releases by specifying anime name
             [ "$source" = "nextep" ] && time_until_next_ep "$query"
 
-            user_query="$(printf "%s" "$query" | tr '+' ' ')"
-            query=$(printf "%s" "$query" | sed 's| |+|g')
+            if [ -z "$result" ]; then
+                user_query="$(printf "%s" "$query" | tr '+' ' ')"
+                query_url=$(printf "%s" "$query" | sed 's| |+|g')
 
-            anime_list=$(hianime_search "$query") || {
-                info "No results found for $query!"
-                sleep 1
-                query=""
-                [ "$hub_mode" = 1 ] && continue || exit 1
-            }
-            [ -z "$anime_list" ] && {
-                info "No results found for $query!"
-                sleep 1
-                query=""
-                [ "$hub_mode" = 1 ] && continue || exit 1
-            }
+                anime_list=$(hianime_search "$query_url") || {
+                    info "No results found for $query!"
+                    sleep 1
+                    query=""
+                    [ "$hub_mode" = 1 ] && continue || exit 1
+                }
+                [ -z "$anime_list" ] && {
+                    info "No results found for $query!"
+                    sleep 1
+                    query=""
+                    [ "$hub_mode" = 1 ] && continue || exit 1
+                }
 
-            if [ "$exact_match" = 1 ]; then
-                _query_norm="$(printf "%s" "$user_query" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
-                anime_list="$(printf "%s\n" "$anime_list" | while IFS="$(printf '\t')" read -r _id _title; do
-                    _title_norm="$(printf "%s" "$_title" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
-                    [ "$_title_norm" = "$_query_norm" ] && printf "%s\t%s\n" "$_id" "$_title"
-                done)"
-                [ -z "$anime_list" ] && die "No exact match found for '$user_query'!"
-            fi
+                if [ "$exact_match" = 1 ]; then
+                    _query_norm="$(printf "%s" "$user_query" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
+                    anime_list="$(printf "%s\n" "$anime_list" | while IFS="$(printf '\t')" read -r _id _title _det; do
+                        _title_norm="$(printf "%s" "$_title" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
+                        [ "$_title_norm" = "$_query_norm" ] && printf "%s\t%s\t%s\n" "$_id" "$_title" "$_det"
+                    done)"
+                    [ -z "$anime_list" ] && die "No exact match found for '$user_query'!"
+                fi
 
-            if [ "$index" -eq "$index" ] 2>/dev/null; then
-                result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-            else
-                result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+                [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+                menu_preview="sh '$script_path' --info {2}"
+                [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+                unset menu_preview
             fi
 
             if [ -z "$result" ]; then
@@ -731,6 +835,7 @@ while :; do
             anime_id="$(printf "%s" "$result" | cut -f 1)"
             episode_maps="$(hianime_episodes "$anime_id")" || {
                 query=""
+                result=""
                 [ "$hub_mode" = 1 ] && continue || exit 1
             }
             ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
@@ -761,6 +866,7 @@ while :; do
 
             if [ "$cancelled" = 1 ]; then
                 query=""
+                result=""
                 ep_no=""
                 [ "$hub_mode" = 1 ] && continue || exit 0
             fi
@@ -769,7 +875,6 @@ while :; do
             ;;
     esac
 done
-
 # moves the cursor up one line and clears that line
 tput cuu1 && tput el
 # stores the position of cursor
