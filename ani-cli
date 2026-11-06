@@ -118,6 +118,10 @@ help_info() {
         Manage favorite anime and view next episode countdowns
       -t, --schedule, --timetable [day]
         Display daily schedule/releases (e.g. today, yesterday, week, friday)
+      -p, --plan, --plan-to-watch
+        Select and play from your MyAnimeList Plan to Watch list
+      -w, --watching
+        Select and play from your MyAnimeList Currently Watching list
       --info
         Show the details of an anime id, this is what the preview pane displays
       --search
@@ -640,6 +644,18 @@ while [ $# -gt 0 ]; do
         --dmenu) menu_program=dmenu ;;
         --skip) skip_intro=1 ;;
         -N | --nextep-countdown) source=nextep ;;
+        -p | --plan | --plan-to-watch)
+            mal_bin="ani-mal"
+            command -v ani-mal >/dev/null 2>&1 || [ -x "${0%/*}/ani-mal" ] && mal_bin="${0%/*}/ani-mal"
+            query=$("$mal_bin" select plan_to_watch)
+            [ -z "$query" ] && exit 0
+            ;;
+        -w | --watching)
+            mal_bin="ani-mal"
+            command -v ani-mal >/dev/null 2>&1 || [ -x "${0%/*}/ani-mal" ] && mal_bin="${0%/*}/ani-mal"
+            query=$("$mal_bin" select watching)
+            [ -z "$query" ] && exit 0
+            ;;
         -f | --fav | --favorites)
             fav_bin="ani-favorites"
             command -v ani-favorites >/dev/null 2>&1 || [ -x "${0%/*}/ani-favorites" ] && fav_bin="${0%/*}/ani-favorites"
@@ -674,7 +690,6 @@ done
 [ "$menu_program" = "fzf" ] && menu_multi_flag="-m"
 [ "$menu_program" = "rofi" ] && menu_multi_flag="-multi-select"
 
-info "Checking dependencies..."
 dep_ch "sed"
 dep_ch "grep"
 [ "$skip_intro" = 1 ] && dep_ch "ani-skip"
@@ -698,14 +713,25 @@ command -v ani-favorites >/dev/null 2>&1 || [ -x "${0%/*}/ani-favorites" ] && fa
 sched_bin="ani-schedule"
 command -v ani-schedule >/dev/null 2>&1 || [ -x "${0%/*}/ani-schedule" ] && sched_bin="${0%/*}/ani-schedule"
 
+mal_bin="ani-mal"
+command -v ani-mal >/dev/null 2>&1 || [ -x "${0%/*}/ani-mal" ] && mal_bin="${0%/*}/ani-mal"
+
 hub_mode=0
 [ -z "$query" ] && [ "$source" = "search" ] && [ -t 0 ] && hub_mode=1
 
 while :; do
     if [ "$hub_mode" = 1 ] && [ -z "$query" ] && [ -z "$result" ] && [ "$source" = "search" ]; then
-        main_menu_choice=$(printf "Favorites\nSearch\nSchedule\nContinue\nQuit\n" | menu "Select option: " "" "$menu_extra_flags")
+        main_menu_choice=$(printf "Plan to Watch\nWatching\nFavorites\nSearch\nSchedule\nContinue\nQuit\n" | menu "Select option: " "" "$menu_extra_flags")
         [ -z "$main_menu_choice" ] || [ "$main_menu_choice" = "Quit" ] && exit 0
         case "$main_menu_choice" in
+            "Plan to Watch")
+                query=$("$mal_bin" select plan_to_watch)
+                [ -z "$query" ] && continue
+                ;;
+            Watching)
+                query=$("$mal_bin" select watching)
+                [ -z "$query" ] && continue
+                ;;
             Favorites)
                 query=$("$fav_bin" select)
                 [ -z "$query" ] && continue

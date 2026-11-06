@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+ani-mal - MyAnimeList companion for ani-cli.
+Allows fuzzy searching and selecting anime directly from your MAL lists.
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import subprocess
+import shutil
+import time
+
+STATE_DIR = os.path.expanduser(os.environ.get("ANI_CLI_HIST_DIR", "~/.local/state/ani-cli"))
+CACHE_TTL = 180  # 3 minutes
+
+def get_client_id():
+    cid = os.environ.get("MAL_CLIENT_ID")
+    if cid:
+        return cid
+    secrets_file = os.path.expanduser("~/.secrets.env")
+    if os.path.exists(secrets_file):
+        try:
+            with open(secrets_file, "r") as f:
+                for line in f:
+                    if line.startswith("MAL_CLIENT_ID="):
+                        return line.strip().split("=", 1)[1].strip("\"'")
+        except Exception:
+            pass
+    return "ea58d724802b654ee16451f5c377b6cf"
+
+def get_username():
+    return os.environ.get("MAL_USERNAME", "exodiaen")
+
+def get_cache_path(status):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, f"mal_cache_{status}.json")
+
+def load_cached_list(status):
+    cache_path = get_cache_path(status)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+                cached_time = data.get("timestamp", 0)
+                if (time.time() - cached_time) < CACHE_TTL:
+                    return data.get("items", [])
+        except Exception:
+            pass
+    return None
+
+def save_cached_list(status, items):
+    cache_path = get_cache_path(status)
+    try:
+        with open(cache_path, "w") as f:
+            json.dump({"timestamp": time.time(), "items": items}, f, indent=2)
+    except Exception:
+        pass
+
+def fetch_mal_list(status, force_refresh=False):
+    if not force_refresh:
+        cached = load_cached_list(status)
+        if cached is not None:
+            return cached
+
+    client_id = get_client_id()
+    username = get_username()
+    url = (
+        f"https://api.myanimelist.net/v2/users/{username}/animelist"
+        f"?status={status}&limit=100&fields=list_status,num_episodes,genres,mean"
+    )
+    req = urllib.request.Request(url, headers={"X-MAL-CLIENT-ID": client_id})
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            items = []
+            for entry in data.get("data", []):
+                node = entry.get("node", {})
+                title = node.get("title", "")
+                if not title:
+                    continue
+                num_eps = node.get("num_episodes") or "?"
+                watched = entry.get("list_status", {}).get("num_episodes_watched", 0)
+                score = node.get("mean") or "-"
+                genres_list = [g.get("name", "") for g in node.get("genres", []) if g.get("name")]
+                genres = ", ".join(genres_list) if genres_list else "Unknown"
+                items.append({
+                    "title": title,
+                    "eps": f"{watched}/{num_eps}",
+                    "score": str(score),
+                    "genres": genres
+                })
+            save_cached_list(status, items)
+            return items
+    except Exception as e:
+        # Fall back to stale cache if network fails
+        cache_path = get_cache_path(status)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    return json.load(f).get("items", [])
+            except Exception:
+                pass
+        sys.stderr.write(f"Error fetching MAL list: {e}\n")
+        return []
+
+def select_with_fzf(items, prompt_text="Select anime: "):
+    if not items:
+        return ""
+    if not shutil.which("fzf"):
+        sys.stderr.write("fzf is required for interactive selection\n")
+        return ""
+
+    lines = [f"{item['title']}\t[Eps: {item['eps']} | Score: {item['score']}]\t{item['genres']}" for item in items]
+    menu_input = "\n".join(lines).encode("utf-8")
+
+    fzf_cmd = [
+        "fzf",
+        "--reverse",
+        "--cycle",
+        f"--prompt={prompt_text}",
+        "--delimiter=\t",
+        "--with-nth=1,2,3",
+        "--tabstop=4"
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, _ = proc.communicate(input=menu_input)
+        if proc.returncode == 0:
+            selected_line = stdout.decode("utf-8").strip()
+            if selected_line:
+                title = selected_line.split("\t")[0].strip()
+                return title
+    except Exception:
+        pass
+    return ""
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "select"
+    status = "plan_to_watch"
+
+    if len(args) > 1:
+        arg_status = args[1].lower().replace("-", "_")
+        if arg_status in ("watching", "plan_to_watch", "completed", "on_hold", "dropped"):
+            status = arg_status
+
+    if cmd in ("select", "--select"):
+        prompt_label = "Plan to Watch" if status == "plan_to_watch" else status.replace("_", " ").title()
+        items = fetch_mal_list(status)
+        choice = select_with_fzf(items, prompt_text=f"MAL ({prompt_label}) > ")
+        if choice:
+            print(choice)
+    elif cmd in ("list", "--list"):
+        items = fetch_mal_list(status)
+        for item in items:
+            print(f"{item['title']}\t{item['eps']}\t{item['score']}\t{item['genres']}")
+    else:
+        # Default behavior: select from plan_to_watch
+        items = fetch_mal_list("plan_to_watch")
+        choice = select_with_fzf(items, prompt_text="MAL (Plan to Watch) > ")
+        if choice:
+            print(choice)
+
+if __name__ == "__main__":
+    main()
