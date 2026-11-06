@@ -964,6 +964,7 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nfavorite\nqu
             else
                 "$fav_bin" add "$anime_title"
             fi
+            continue
             ;;
         *)
             cleanup
