@@ -928,10 +928,25 @@ play
 
 while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nfavorite\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
     case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
+        next)
+            _next_ep=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
+            if [ -z "$_next_ep" ]; then
+                info "No next episode available"
+                continue
+            fi
+            ep_no="$_next_ep"
+            ;;
         replay) video_link="$replay" ;;
-        previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
+        previous)
+            _prev_ep=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null
+            if [ -z "$_prev_ep" ]; then
+                info "No previous episode available"
+                continue
+            fi
+            ep_no="$_prev_ep"
+            ;;
         select)
+            _selected_ep=""
             while :; do
                 fav_label="⭐ Add to Favorites"
                 if grep -qi "^${anime_title}$" "${hist_dir}/favorites.txt" 2>/dev/null; then
@@ -947,11 +962,13 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nfavorite\nqu
                         "$fav_bin" remove "$anime_title"
                         ;;
                     *)
-                        ep_no="$selection"
+                        _selected_ep="$selection"
                         break
                         ;;
                 esac
             done
+            [ -z "$_selected_ep" ] && continue
+            ep_no="$_selected_ep"
             ;;
         change_quality)
             new_quality="$(printf "%s" "$links" | menu "Select Quality: " "" "$menu_extra_flags" | cut -d ">" -f 1)"
