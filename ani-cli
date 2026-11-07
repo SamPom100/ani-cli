@@ -414,7 +414,12 @@ backup_old_hist() {
 process_hist_entry() {
     ep_list=$(hianime_episodes "$anime_id" | cut -f 2)
     next_ep=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
-    [ -n "$next_ep" ] && printf "%s\t%s (Next: Episode %s | Last watched: Episode %s)\t%s\t%s\n" "$anime_id" "$anime_title" "$next_ep" "$ep_no" "$next_ep" "$anime_title"
+    last_ep=$(printf "%s\n" "$ep_list" | tail -n 1)
+    if [ -n "$next_ep" ]; then
+        printf "%s\t%s (Next: Episode %s | Last watched: Episode %s)\t%s\t%s\n" "$anime_id" "$anime_title" "$next_ep" "$ep_no" "$next_ep" "$anime_title"
+    elif [ -n "$last_ep" ]; then
+        printf "%s\t%s (Caught up: Episode %s/%s)\t%s\t%s\n" "$anime_id" "$anime_title" "$ep_no" "$last_ep" "$ep_no" "$anime_title"
+    fi
 }
 
 update_history() {
@@ -782,12 +787,12 @@ while :; do
             wait
             if [ -z "$anime_list" ]; then
                 if [ "$hub_mode" = 1 ]; then
-                    info "No unwatched series in history!"
+                    info "No watch history found!"
                     sleep 1.5
                     source=search
                     continue
                 else
-                    die "No unwatched series in history!"
+                    die "No watch history found!"
                 fi
             fi
             menu_preview="sh '$script_path' --info {2}"
