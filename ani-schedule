@@ -276,7 +276,6 @@ def main():
     if not lines:
         print(f"No scheduled releases found for {prompt_label}.")
         sys.exit(0)
-        entry_map[menu_line] = entry["title"]
 
     menu_input = "\n".join(lines).encode("utf-8")
     try:
