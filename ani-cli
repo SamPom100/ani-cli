@@ -148,19 +148,33 @@ version_info() {
 
 update_script() {
     info "[branch:$branch] Checking for Update.."
-    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/pystardust/ani-cli/$branch/ani-cli")" || die "[branch:$branch] Connection error: $update"
+    repo_raw="https://raw.githubusercontent.com/SamPom100/ani-cli/$branch"
+    update="$($curl_exe --fail-with-body -sL -A "$agent" "${repo_raw}/ani-cli")" || die "[branch:$branch] Connection error: $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
     [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
     printf "%s" "$update" | grep -q "^version_number" || die "[branch:$branch] Invalid response."
-    update="$(printf "%s\n" "$update" | diff -u "$0" -)"
-    if [ -z "$update" ]; then
+
+    target_dir="${0%/*}"
+
+    # Also update companion scripts if present in destination directory
+    for comp in ani-favorites ani-schedule ani-mal; do
+        if [ -w "$target_dir/$comp" ] || [ -w "$target_dir" ]; then
+            $curl_exe -sL -A "$agent" "${repo_raw}/$comp" -o "$target_dir/$comp.tmp" 2>/dev/null
+            if [ -s "$target_dir/$comp.tmp" ]; then
+                mv "$target_dir/$comp.tmp" "$target_dir/$comp"
+                chmod +x "$target_dir/$comp"
+            else
+                rm -f "$target_dir/$comp.tmp"
+            fi
+        fi
+    done
+
+    # Check if ani-cli itself changed
+    if printf "%s\n" "$update" | cmp -s "$0" -; then
         info "[branch:$branch] Script is up to date :) ($version_number)"
     else
-        if printf "%s\n" "$update" | patch "$0" -; then
-            info "[branch:$branch] Updated: $version_number -> $new_version"
-        else
-            die "[branch:$branch] Failed to update. Read the above line!"
-        fi
+        printf "%s\n" "$update" > "$0.tmp" && mv "$0.tmp" "$0" && chmod +x "$0" || die "[branch:$branch] Failed to update $0"
+        info "[branch:$branch] Updated: $version_number -> $new_version"
     fi
     exit 0
 }
