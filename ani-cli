@@ -148,8 +148,8 @@ version_info() {
 
 update_script() {
     info "[branch:$branch] Checking for Update.."
-    repo_raw="https://raw.githubusercontent.com/SamPom100/ani-cli/$branch"
-    update="$($curl_exe --fail-with-body -sL -A "$agent" "${repo_raw}/ani-cli")" || die "[branch:$branch] Connection error: $update"
+    api_url="https://api.github.com/repos/SamPom100/ani-cli/contents/%s?ref=$branch"
+    update="$($curl_exe --fail-with-body -sL -A "$agent" -H "Accept: application/vnd.github.v3.raw" "$(printf "$api_url" "ani-cli")")" || die "[branch:$branch] Connection error: $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
     [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
     printf "%s" "$update" | grep -q "^version_number" || die "[branch:$branch] Invalid response."
@@ -159,7 +159,7 @@ update_script() {
     # Also update companion scripts if present in destination directory
     for comp in ani-favorites ani-schedule ani-mal; do
         if [ -w "$target_dir/$comp" ] || [ -w "$target_dir" ]; then
-            $curl_exe -sL -A "$agent" "${repo_raw}/$comp" -o "$target_dir/$comp.tmp" 2>/dev/null
+            $curl_exe -sL -A "$agent" -H "Accept: application/vnd.github.v3.raw" "$(printf "$api_url" "$comp")" -o "$target_dir/$comp.tmp" 2>/dev/null
             if [ -s "$target_dir/$comp.tmp" ]; then
                 mv "$target_dir/$comp.tmp" "$target_dir/$comp"
                 chmod +x "$target_dir/$comp"
