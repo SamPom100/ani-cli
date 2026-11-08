@@ -403,6 +403,41 @@ def interactive_menu(emit_title_only=False):
                 tty_print(f"\033[1;34mLaunching ani-cli for:\033[0m {selected_title}")
                 os.execvp("ani-cli", ["ani-cli", selected_title])
 
+def get_badges_for_titles(titles):
+    if not titles:
+        return
+    infos = fetch_all_favorites_info(titles)
+    by_query = {item["query_title"].lower(): item for item in infos}
+    for title in titles:
+        item = by_query.get(title.lower())
+        badge = item.get("clean_badge", "") if item else ""
+        if badge in ("UNKNOWN", "Unknown"):
+            badge = ""
+        print(f"{title}\t{badge}")
+
+def annotate_history_stream():
+    lines = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+    if not lines:
+        return
+    titles = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            titles.append(parts[3])
+    infos = fetch_all_favorites_info(titles) if titles else []
+    by_query = {item["query_title"].lower(): item for item in infos}
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            anime_id, disp, ep, title = parts[0], parts[1], parts[2], parts[3]
+            info = by_query.get(title.lower())
+            badge = info.get("clean_badge", "") if info else ""
+            if badge and badge not in ("UNKNOWN", "Unknown"):
+                disp = f"[{badge}]  {disp}"
+            print(f"{anime_id}\t{disp}\t{ep}\t{title}")
+        else:
+            print(line)
+
 def print_help():
     print("""Usage:
   ani-favorites                      # Open interactive favorites menu
@@ -410,6 +445,8 @@ def print_help():
   ani-favorites add <anime title>    # Add an anime to favorites
   ani-favorites remove [anime title] # Remove an anime from favorites
   ani-favorites select               # Emit selected title to stdout (used by ani-cli)
+  ani-favorites badge <title...>     # Output TSV of title and countdown/status badge
+  ani-favorites annotate             # Add countdown badges to ani-cli TSV input stream
 
 Storage:
   ~/.local/state/ani-cli/favorites.txt
@@ -432,6 +469,10 @@ def main():
         refresh_cache_background()
     elif cmd in ("-l", "--list", "list"):
         list_favorites()
+    elif cmd in ("badge", "--badge"):
+        get_badges_for_titles(args[1:])
+    elif cmd in ("annotate", "--annotate"):
+        annotate_history_stream()
     elif cmd in ("add", "-a", "--add"):
         if len(args) < 2:
             title = tty_input("\033[1;36mEnter anime name to add: \033[0m")
